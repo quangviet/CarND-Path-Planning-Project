@@ -7,25 +7,24 @@
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
-#include "Eigen-3.3/Eigen/Dense"
 #include "json.hpp"
 #include "spline.h"
 
-// Number of points to be kept from previous path
-#define KEEP_POINTS 6
+#define MAX_VELOCITY 22.0
+#define INC_VELOCITY 0.1
 
-// Number of points in the new path
-#define PREDICT_POINTS 50
+#define REF_DISTANCE 30
+#define STATE_KEEP_LANE 0
+#define STATE_SWITCH_LEFT 1
+#define STATE_SWITCH_RIGHT 2
+#define STATE_FOLLOW 3
 
-// Duration of each trajectory
-#define PREDICT_TIME 2
+#define FRONT_SAFE_DISTANCE 30
+#define REAR_SAFE_DISTANCE 5
 
-// Maximum veolocity of the vehicle in meter per second
-#define MAX_VELOCITY 22
+#define OUTPUT_POINTS 50
 
 using namespace std;
-using Eigen::MatrixXd;
-using Eigen::VectorXd;
 
 // for convenience
 using json = nlohmann::json;
@@ -50,11 +49,13 @@ string hasData(string s) {
   return "";
 }
 
-double distance(double x1, double y1, double x2, double y2) {
+double distance(double x1, double y1, double x2, double y2)
+{
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
+int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
+{
 
-int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y) {
 	double closestLen = 100000; //large number
 	int closestWaypoint = 0;
 
@@ -72,9 +73,12 @@ int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vect
 	}
 
 	return closestWaypoint;
+
 }
 
-int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y) {
+int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+
 	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
 
 	double map_x = maps_x[closestWaypoint];
@@ -89,15 +93,13 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 		closestWaypoint++;
 	}
 
-  if (closestWaypoint >= maps_x.size()) {
-    closestWaypoint = 0;
-  }
-
 	return closestWaypoint;
+
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
-vector<double> getFrenet(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y) {
+vector<double> getFrenet(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+{
 	int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
 
 	int prev_wp;
@@ -141,10 +143,12 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 	frenet_s += distance(0,0,proj_x,proj_y);
 
 	return {frenet_s,frenet_d};
+
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y) {
+vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
+{
 	int prev_wp = -1;
 
 	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1) ))
@@ -167,30 +171,7 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 	double y = seg_y + d*sin(perp_heading);
 
 	return {x,y};
-}
 
-vector<double> JMT(vector< double> start, vector <double> end, double T) {
-  MatrixXd A = MatrixXd(3, 3);
-  A << T*T*T, T*T*T*T, T*T*T*T*T,
-          3*T*T, 4*T*T*T,5*T*T*T*T,
-          6*T, 12*T*T, 20*T*T*T;
-    
-  MatrixXd B = MatrixXd(3,1);     
-  B << end[0]-(start[0]+start[1]*T+.5*start[2]*T*T),
-          end[1]-(start[1]+start[2]*T),
-          end[2]-start[2];
-          
-  MatrixXd Ai = A.inverse();
-  
-  MatrixXd C = Ai*B;
-  
-  vector <double> result = {start[0], start[1], .5*start[2]};
-  for(int i = 0; i < C.size(); i++)
-  {
-      result.push_back(C.data()[i]);
-  }
-  
-  return result;  
 }
 
 void globalToLocal(double &x, double &y, double theta, double dx, double dy) {
@@ -244,7 +225,10 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  double ref_velocity = 0;       
+  double ref_lane = 1;
+
+  h.onMessage([&ref_velocity, &ref_lane, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -262,435 +246,167 @@ int main() {
         
         if (event == "telemetry") {
           // j[1] is the data JSON object
-
-          typedef std::chrono::high_resolution_clock clock;
-          std::chrono::time_point<clock> start = clock::now();           
           
         	// Main car's localization Data
-        	double car_x = j[1]["x"];
-        	double car_y = j[1]["y"];
-        	double car_s = j[1]["s"];
-        	double car_d = j[1]["d"];
-        	double car_yaw = j[1]["yaw"];
-        	double car_speed = j[1]["speed"];
+          	double car_x = j[1]["x"];
+          	double car_y = j[1]["y"];
+          	double car_s = j[1]["s"];
+          	double car_d = j[1]["d"];
+          	double car_yaw = j[1]["yaw"];
+          	double car_speed = j[1]["speed"];
 
-          // Convert yaw to radians, speed to meter per second
-          car_yaw = deg2rad(car_yaw);
-          car_speed *= 0.44704;
-        	
-        	//printf("x = %7.2f, y = %7.2f, v = %5.2f", car_x, car_y, car_speed);
+          	// Previous path data given to the Planner
+          	auto previous_path_x = j[1]["previous_path_x"];
+          	auto previous_path_y = j[1]["previous_path_y"];
+          	// Previous path's end s and d values 
+          	double end_path_s = j[1]["end_path_s"];
+          	double end_path_d = j[1]["end_path_d"];
 
-        	// Previous path data given to the Planner
-        	auto previous_path_x = j[1]["previous_path_x"];
-        	auto previous_path_y = j[1]["previous_path_y"];
-        	// Previous path's end s and d values 
-        	double end_path_s = j[1]["end_path_s"];
-        	double end_path_d = j[1]["end_path_d"];
+          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
+          	auto sensor_fusion = j[1]["sensor_fusion"];
 
-        	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-        	auto sensor_fusion = j[1]["sensor_fusion"];
+          	json msgJson;
 
-        	json msgJson;
+          	vector<double> next_x_vals;
+          	vector<double> next_y_vals;
 
-        	vector<double> next_x_vals;
-        	vector<double> next_y_vals;
+            double theta = deg2rad(car_yaw);
 
-          /*
-            I calculate the base parameter of the car. If this is the first time, the previous_path.size() will be zero.
-            In this case, base car parameter is based on the current car information.
+            vector<double> spline_x;
+            vector<double> spline_y;
 
-            If previous path existed, we keep a certain number of points from the previous path (KEEP_POINTS), and base
-            parameter will based on the last points among the points we kept.
+            double ref_s = car_s;
 
-            I calculated the velocity and acceleration in s and d (vs, vd, as, ad) as well.
-            I also added some point from the previous path to the spline reference points.
-          */
-          double base_car_x = car_x;
-          double base_car_y = car_y;
+            /*
+              We reused all the previously generated points and shift/rotate these poitns to local coordinates
+            */
+            if (previous_path_x.size() > 0) {
+              car_x = previous_path_x[previous_path_x.size() - 1];
+              car_y = previous_path_y[previous_path_y.size() - 1];
 
-          double base_car_s = car_s;
-          double base_car_d = car_d;
+              double car_lx = previous_path_x[previous_path_x.size() - 2];
+              double car_ly = previous_path_y[previous_path_y.size() - 2];
 
-          double base_car_vs = 0;
-          double base_car_vd = 0;
-          double base_car_as = 0;
-          double base_car_ad = 0;
-          
-          double base_car_theta = car_yaw;
+              theta = atan2(car_y - car_ly, car_x - car_lx);
+              ref_s = end_path_s;
 
-          vector<double> spline_x;
-          vector<double> spline_y;
+              for (int i = 0; i < previous_path_x.size();i++) {
+                double px = previous_path_x[i];
+                double py = previous_path_y[i];
 
-          if (previous_path_x.size() > KEEP_POINTS) {
-            base_car_x = previous_path_x[KEEP_POINTS];
-            base_car_y = previous_path_y[KEEP_POINTS];
+                next_x_vals.push_back(px);
+                next_y_vals.push_back(py);
 
-            for (int i = 0; i < KEEP_POINTS; i++) {
-              next_x_vals.push_back(double(previous_path_x[i]));
-              next_y_vals.push_back(double(previous_path_y[i]));
+                globalToLocal(px, py, theta, car_x, car_y);
+                spline_x.push_back(px);
+                spline_y.push_back(py);
+              } 
+            } else {
+              spline_x.push_back(0);
+              spline_y.push_back(0);
             }
 
-            double last_car_x = previous_path_x[KEEP_POINTS-1];
-            double last_car_y = previous_path_y[KEEP_POINTS-1];
+            /*
+              Check the feasibilities of 3 possible action: Keep current lane, switch left or switch right
+            */
 
-            double last_last_car_x = previous_path_x[KEEP_POINTS-2];
-            double last_last_car_y = previous_path_y[KEEP_POINTS-2];
+            bool keep_lane_ok = true;
+            bool switch_left_ok = true;            
+            bool switch_right_ok = true;
 
-            base_car_theta = atan2(base_car_y - last_car_y, base_car_x - last_car_x);
-            auto sd = getFrenet(base_car_x, base_car_y, base_car_theta, map_waypoints_x, map_waypoints_y);
+            for (int i = 0; i < sensor_fusion.size(); i++) {
+              double obj_vx = sensor_fusion[i][3];
+              double obj_vy = sensor_fusion[i][4];
+              double obj_v = sqrt(obj_vx * obj_vx + obj_vy * obj_vy);
+              double obj_s = double(sensor_fusion[i][5]) + obj_v * previous_path_x.size() * 0.02;
+              double obj_d = sensor_fusion[i][6];
 
-            base_car_s = sd[0];
-            base_car_d = sd[1];
+              if ((abs(obj_d - (ref_lane * 4 + 2)) < 2) && (obj_s > ref_s) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+                keep_lane_ok = false;
+              }
 
-            double velocity = distance(base_car_x, base_car_y, last_car_x, last_car_y) * 50;
+              if ((abs(obj_d - (ref_lane * 4 - 2)) < 2) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+                switch_left_ok = false;
+              }
 
-            int next_wp = NextWaypoint(base_car_x, base_car_y, base_car_theta, map_waypoints_x, map_waypoints_y);
-            int prev_wp = next_wp - 1;
-            if (prev_wp < 0) {
-              prev_wp = map_waypoints_x.size() - 1;
-            }
-
-            double waypoint_theta = atan2(map_waypoints_y[next_wp] - map_waypoints_y[prev_wp], map_waypoints_x[next_wp] - map_waypoints_x[prev_wp]);
-            double diff_theta = waypoint_theta - base_car_theta;
-
-            //printf(" next_wp = %d prev_wp = %d\n", next_wp, prev_wp);
-            //printf(", diff_theta = %9.3f waypoint_theta = %9.3f base_car_theta = %9.3f", diff_theta, waypoint_theta, base_car_theta);
-
-            base_car_vs = velocity * cos(diff_theta);
-            base_car_vd = velocity * sin(diff_theta);
-
-            double vx = (base_car_x - last_car_x) * 50;
-            double vy = (base_car_y - last_car_y) * 50;
-
-            double last_vx = (last_car_x - last_last_car_x) * 50;
-            double last_vy = (last_car_y - last_last_car_y) * 50;
-
-            double ax = vx - last_vx;
-            double ay = vy - last_vy;
-
-            double accel = distance(vx, vy, last_vx, last_vy);
-            double accel_theta = atan2(ay, ax);
-            double diff_accel_theta = waypoint_theta - accel_theta;
-
-            base_car_as = accel * cos(diff_accel_theta);
-            base_car_ad = accel * sin(diff_accel_theta);     
-
-            double start_x = previous_path_x[0];
-            double start_y = previous_path_y[0];
-
-            globalToLocal(start_x, start_y, base_car_theta, base_car_x, base_car_y);
-
-            spline_x.push_back(start_x);
-            spline_x.push_back(0);
-
-            spline_y.push_back(start_y);
-            spline_y.push_back(0);
-          } else {
-            spline_x.push_back(0);
-            spline_y.push_back(0);
-          }
-
-          double best_v;
-          double best_s;
-          double best_a;
-          double best_cost = 1e+15;
-          
-          double best_d;
-          double best_d_time;
-
-          /*
-            Because repeately calculating the JMT will comsume quite alot of computing power, I precalculated the JMT and store
-            them in this vector. Later all I have to do is lookup the value.
-          */
-
-          vector<vector<double>> d_jmt;
-
-          for (double target_d = 2; target_d <= 10; target_d += 4) {
-            for (double d_time = 0.1; d_time <= PREDICT_TIME; d_time += 0.2) {
-              d_jmt.push_back(JMT({base_car_d, base_car_vd, base_car_ad}, {target_d, 0, 0}, d_time));
-            }
-          }
-
-          /*
-            I also precalculated the approximately position of other cars in each point of time. 
-            This speed up thing a little bit.
-
-            Here I assume that all other cars have constant velocity in frenet coordinates, which means
-            they are moving along the road in constant rate (velocity).
-          */
-
-          double obj_pred_s[20][10];
-          double obj_pred_d[20]; 
-
-          int fusion_size = sensor_fusion.size();
-          for (int i = 0; i < fusion_size; i++) {
-            double obj_vx = sensor_fusion[i][3];
-            double obj_vy = sensor_fusion[i][4];
-            double obj_s = sensor_fusion[i][5];
-            double obj_v = sqrt(obj_vx * obj_vx + obj_vy * obj_vy);
-            obj_pred_d[i] = sensor_fusion[i][6];
-
-            int t_count = 0;
-            for (double t = 0.1; t <= PREDICT_TIME; t += 0.2) {
-              obj_pred_s[i][t_count] = obj_s + obj_v * (t + 0.02 * next_x_vals.size());
-              t_count++;
-            }
-          }
-
-          /*
-            Here I generate a number of trajectories using quintic polynomials.
-            JMT was used to find the solution of the polynomials.
-
-            For each trajactory generated, I calculated the cost and find the the trajectory with the smallest 
-            cost.
-          */
-
-          for (double target_v = 7.5; target_v <= (MAX_VELOCITY+2); target_v += 2) {
-            for (double target_s = 10; target_s <= (MAX_VELOCITY+2) * PREDICT_TIME; target_s += 4) {
-              for (double target_a = -4; target_a <= 4; target_a += 2) {
-                auto coeff = JMT({0, base_car_vs, base_car_as}, {target_s, target_v, target_a}, PREDICT_TIME);
-
-                int d_jmt_count = 0;
-                for (double target_d = 2; target_d <= 10; target_d += 4) {
-                  for (double d_time = 0.1; d_time <= PREDICT_TIME; d_time += 0.2) {
-                    vector<double> d_coeff = d_jmt[d_jmt_count];
-                    d_jmt_count++;
-              
-                    double cost = (MAX_VELOCITY * PREDICT_TIME - target_s) * 10000000 + abs(target_d - base_car_d) * 1000; 
-
-                    int t_count = 0;
-                    for (double t = 0.1; t <= PREDICT_TIME; t += 0.2) {
-                      double p_s = base_car_s 
-                                  + coeff[0] 
-                                  + coeff[1] * t 
-                                  + coeff[2] * t * t 
-                                  + coeff[3] * t * t * t
-                                  + coeff[4] * t * t * t * t
-                                  + coeff[5] * t * t * t * t * t;
-
-                      double p_d = target_d;
-                      double vt_d = 0;
-                      double at_d = 0;
-                      double jt_d = 0;
-                                  
-                      if (t <= d_time) {
-                        p_d = d_coeff[0] 
-                            + d_coeff[1] * t 
-                            + d_coeff[2] * t * t 
-                            + d_coeff[3] * t * t * t
-                            + d_coeff[4] * t * t * t * t
-                            + d_coeff[5] * t * t * t * t * t;
-
-                        vt_d = d_coeff[1] 
-                             + 2 * d_coeff[2] * t 
-                             + 3 * d_coeff[3] * t * t 
-                             + 4 * d_coeff[4] * t * t * t
-                             + 5 * d_coeff[5] * t * t * t * t;
-                   
-                        at_d = 2  * d_coeff[2] 
-                             + 6  * d_coeff[3] * t 
-                             + 12 * d_coeff[4] * t * t
-                             + 20 * d_coeff[5] * t * t * t;
-                           
-                        jt_d = 6  * d_coeff[3] 
-                             + 24 * d_coeff[4] * t
-                             + 60 * d_coeff[5] * t * t;
-                      }
-                    
-                      double vt_s = coeff[1] 
-                                  + 2 * coeff[2] * t 
-                                  + 3 * coeff[3] * t * t 
-                                  + 4 * coeff[4] * t * t * t
-                                  + 5 * coeff[5] * t * t * t * t;
-                         
-                      double at_s = 2  * coeff[2] 
-                                  + 6  * coeff[3] * t 
-                                  + 12 * coeff[4] * t * t
-                                  + 20 * coeff[5] * t * t * t;
-                         
-                      double jt_s = 6  * coeff[3] 
-                                  + 24 * coeff[4] * t
-                                  + 60 * coeff[5] * t * t;
-                                  
-                                  
-                      double vt = sqrt(vt_s * vt_s + vt_d * vt_d);          
-
-                      if (vt_s < 0){
-                        cost = 1e+15;
-                        break;
-                      }
-
-                      if (t < 0.2) {
-                        if (abs(at_s) > 10) {
-                          cost = 1e+15;
-                          break;
-                        }
-                        
-                        if (abs(at_d) > 10) {
-                          cost = 1e+15;
-                          break;
-                        }           
-
-                        if (vt > MAX_VELOCITY) {
-                          cost = 1e+15;
-                          break;
-                        } 
-
-
-                        if ((at_s*at_s + at_d * at_d) > 100) {
-                          cost = 1e+15;
-                          break;
-                        }
-             
-
-                        if ((jt_s*jt_s + jt_d*jt_d) > 2500) {
-                          cost = 1e+15;
-                          break;
-                        }
-
-                      } else {                      
-                        if (abs(vt) > MAX_VELOCITY + 3) {
-                          cost = 1e+15;
-                          break;
-                        }
-                        if (abs(at_s) > 50) {
-                          cost = 1e+15;
-                          break;
-                        }
-                        
-                        if (abs(at_d) > 50) {
-                          cost = 1e+15;
-                          break;
-                        }           
-
-                        if ((at_s*at_s + at_d * at_d) > 1000) {
-                          cost = 1e+15;
-                          break;
-                        }
-             
-                        if ((jt_s*jt_s + jt_d*jt_d) > 20000) {
-                          cost = 1e+15;
-                          break;
-                        }
-
-                      }
-
-                      for (int i = 0; i < fusion_size; i++) {
-                        double pred_s = obj_pred_s[i][t_count];
-                        double pred_d = obj_pred_d[i];
-                        if ((abs(p_s - pred_s) < 10) && (abs(p_d - pred_d) < 3)) {
-                          cost = 1e+15;
-                          break;
-                        } else if (abs(p_d - pred_d) < 3) {
-                          cost += 80000/abs(p_s - pred_s);
-                        }
-                      }
-                      t_count++;
-                     
-                      double lane_diff = abs(target_d - p_d);                          
-
-                      cost += (vt - MAX_VELOCITY) * (vt - MAX_VELOCITY) + lane_diff * lane_diff * 10000;
-                      if (cost >= best_cost) {
-                        break;
-                      }
-                    }
-
-                    if (cost < best_cost) {
-                      best_cost = cost;
-                      best_a = target_a;
-                      best_v = target_v;
-                      best_s = target_s;
-                      
-                      best_d = target_d;
-                      best_d_time = d_time;
-                    }                        
-                  }
-                }
-                
+              if ((abs(obj_d - (ref_lane * 4 + 6)) < 2) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+                switch_right_ok = false;
               }
             }
-          }
 
-          /*
-            Based on the trajectory with the optimized cost, I generated some reference points and added them to
-            the spline. 
+            /*
+              My simple state machine
+            */
 
-            Due to the inconsistencies in the conversion between the frenet frame and cartesian coordinates, I
-            had to ignore some point which x < last x
-          */
+            int next_action = STATE_KEEP_LANE;
+            if (!keep_lane_ok) {
+              next_action = STATE_FOLLOW;
+              if ((ref_lane > 0) && switch_left_ok) {
+                next_action = STATE_SWITCH_LEFT;
+                ref_lane = ref_lane - 1;
+              } 
 
-          double last_sp_x = 0;
-
-          auto coeff = JMT({0, base_car_vs, base_car_as}, {best_s, best_v, best_a}, PREDICT_TIME);
-          auto d_coeff = JMT({car_d, base_car_vd, base_car_ad}, {best_d, 0, 0}, best_d_time);
-
-          for (double t = 0.5; t <= PREDICT_TIME; t += 0.5) {
-            double car_s = base_car_s 
-                           + coeff[0]
-                           + coeff[1] * t 
-                           + coeff[2] * t * t
-                           + coeff[3] * t * t * t 
-                           + coeff[4] * t * t * t * t
-                           + coeff[5] * t * t * t * t * t;
-                           
-            double car_d = best_d;
-            if (t <= best_d_time) {
-              car_d = d_coeff[0]
-                    + d_coeff[1] * t 
-                    + d_coeff[2] * t * t
-                    + d_coeff[3] * t * t * t 
-                    + d_coeff[4] * t * t * t * t
-                    + d_coeff[5] * t * t * t * t * t;
-            }       
-
-            auto xy = getXY(car_s, car_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-            double lx = xy[0];
-            double ly = xy[1];
-
-            globalToLocal(lx, ly, base_car_theta, base_car_x, base_car_y);
-            if (lx > last_sp_x) {
-              last_sp_x = lx;
-              spline_x.push_back(lx);
-              spline_y.push_back(ly);
+              if ((next_action == 3) && (ref_lane < 2) && switch_right_ok){
+                next_action = STATE_SWITCH_RIGHT;
+                ref_lane = ref_lane + 1;
+              } 
             }
-          }
 
-          /*
-            We now have a spline of the optimized trajactory. All we have to do is generate all the points based on
-            the spline and added them to the next_x_vals and next_y_vals.
-          */
+            if (next_action == STATE_FOLLOW) {
+              ref_velocity -= INC_VELOCITY;
+              if (ref_velocity < 0) {
+                ref_velocity = 0;
+              }
+            } else {
+              if (ref_velocity < MAX_VELOCITY) {
+                ref_velocity += INC_VELOCITY;
+              }
+              if (ref_velocity > MAX_VELOCITY) {
+                ref_velocity = MAX_VELOCITY;
+              }
+            }
 
-          tk::spline traj_spline;
-          traj_spline.set_points(spline_x, spline_y);
+            /*
+              Create some extra points in the future path and smooth the outputs. 
+              Then I reversed back to the global coordinate and return the path.
+            */
 
-          for (double t = 0; t < PREDICT_TIME; t += 0.02) {
-            double lx = coeff[0]
-                      + coeff[1] * t 
-                      + coeff[2] * t * t
-                      + coeff[3] * t * t * t 
-                      + coeff[4] * t * t * t * t
-                      + coeff[5] * t * t * t * t * t;              
+            for (int i = 1; i < 4; i++) {
+              auto xy = getXY(ref_s + REF_DISTANCE * i, ref_lane * 4 + 2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+              double px = xy[0];
+              double py = xy[1];
 
-            double ly = traj_spline(lx);
-            localToGlobal(lx, ly, base_car_theta, base_car_x, base_car_y);
+              globalToLocal(px, py, theta, car_x, car_y);
+              spline_x.push_back(px);
+              spline_y.push_back(py);
+            }
 
-            if (next_x_vals.size() < PREDICT_POINTS) {
+            tk::spline ref_spline;
+            ref_spline.set_points(spline_x, spline_y);
+
+            double dist = distance(0, 0, REF_DISTANCE, ref_spline(REF_DISTANCE));
+            double delta_x = REF_DISTANCE * ref_velocity / (dist * 50);
+
+            double current_x = 0;
+
+            while (next_x_vals.size() < OUTPUT_POINTS) {
+              current_x +=  delta_x;
+              double lx = current_x;
+              double ly = ref_spline(lx);
+              localToGlobal(lx, ly, theta, car_x, car_y);
+
               next_x_vals.push_back(lx);
-              next_y_vals.push_back(ly);              
+              next_y_vals.push_back(ly);
             }
-          }
 
-        	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-        	msgJson["next_x"] = next_x_vals;
-        	msgJson["next_y"] = next_y_vals;
+          	msgJson["next_x"] = next_x_vals;
+          	msgJson["next_y"] = next_y_vals;
 
-        	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
-          double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start).count();            
-          //printf(" elapsed = %5.2fms\n", elapsed);
-
-        	//this_thread::sleep_for(chrono::milliseconds(1000));
-        	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          	//this_thread::sleep_for(chrono::milliseconds(1000));
+          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          
         }
       } else {
         // Manual driving
