@@ -10,8 +10,8 @@
 #include "json.hpp"
 #include "spline.h"
 
-#define MAX_VELOCITY 22.0
-#define INC_VELOCITY 0.1
+#define MAX_VELOCITY 21.5
+#define INC_VELOCITY 0.17
 
 #define REF_DISTANCE 30
 #define STATE_KEEP_LANE 0
@@ -19,10 +19,11 @@
 #define STATE_SWITCH_RIGHT 2
 #define STATE_FOLLOW 3
 
-#define FRONT_SAFE_DISTANCE 30
-#define REAR_SAFE_DISTANCE 5
+#define FRONT_SAFE_DISTANCE 25
+#define REAR_SAFE_DISTANCE 8
 
 #define OUTPUT_POINTS 50
+#define MUST_KEEP_POINTS 5
 
 using namespace std;
 
@@ -278,19 +279,79 @@ int main() {
             double ref_s = car_s;
 
             /*
+              Check if the previous path still valid 
+            */
+            bool last_path_ok = true;
+
+            vector<double> path_s;
+            vector<double> path_d;
+            for (int i = 0; i < previous_path_x.size(); i++) {
+                auto sd = getFrenet(previous_path_x[i], previous_path_y[i], theta, map_waypoints_x, map_waypoints_y);
+                path_s.push_back(sd[0]);
+                path_d.push_back(sd[1]);
+            }
+
+            for (int i = 0; i < sensor_fusion.size(); i++) {
+              double obj_vx = sensor_fusion[i][3];
+              double obj_vy = sensor_fusion[i][4];
+              double obj_v = sqrt(obj_vx * obj_vx + obj_vy * obj_vy);
+              double obj_s = sensor_fusion[i][5];
+              double obj_d = sensor_fusion[i][6];
+
+              for (int j = 0; j < previous_path_x.size(); j++) {
+                double pred_s = obj_s + obj_v * (j+1) * 0.02;
+                if ((abs(path_s[j] - pred_s) < 4) && (abs(path_d[j] - obj_d) < 2.3) && (obj_s > car_s - 2)) {
+                  auto xy = getXY(pred_s, obj_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+                  if (distance(xy[0], xy[1], previous_path_x[j], previous_path_y[j]) < 4) {
+                    last_path_ok = false;
+                    break;
+                  }
+                }
+              }
+            }
+
+            int reused_points = previous_path_x.size();
+
+            /*
+              We change the reference speed and lane accordingly in case last path was not reusable
+            */
+            if (!last_path_ok) {
+              reused_points = MUST_KEEP_POINTS;
+
+              end_path_s = path_s[MUST_KEEP_POINTS - 1];
+              end_path_d = path_d[MUST_KEEP_POINTS - 1];
+              
+              if (end_path_d < 4) {
+                ref_lane = 0;
+              } else if (end_path_d < 8) {
+                ref_lane = 1;
+              } else {
+                ref_lane = 2;
+              }
+
+              double car_x = previous_path_x[reused_points - 1];
+              double car_y = previous_path_y[reused_points - 1];
+
+              double car_lx = previous_path_x[reused_points - 2];
+              double car_ly = previous_path_y[reused_points - 2];              
+
+              ref_velocity = distance(car_x, car_y, car_lx, car_ly) * 50;
+            }
+
+            /*
               We reused all the previously generated points and shift/rotate these poitns to local coordinates
             */
-            if (previous_path_x.size() > 0) {
-              car_x = previous_path_x[previous_path_x.size() - 1];
-              car_y = previous_path_y[previous_path_y.size() - 1];
+            if (reused_points > 0) {
+              car_x = previous_path_x[reused_points - 1];
+              car_y = previous_path_y[reused_points - 1];
 
-              double car_lx = previous_path_x[previous_path_x.size() - 2];
-              double car_ly = previous_path_y[previous_path_y.size() - 2];
+              double car_lx = previous_path_x[reused_points - 2];
+              double car_ly = previous_path_y[reused_points - 2];
 
               theta = atan2(car_y - car_ly, car_x - car_lx);
               ref_s = end_path_s;
 
-              for (int i = 0; i < previous_path_x.size();i++) {
+              for (int i = 0; i < reused_points;i++) {
                 double px = previous_path_x[i];
                 double py = previous_path_y[i];
 
@@ -318,18 +379,18 @@ int main() {
               double obj_vx = sensor_fusion[i][3];
               double obj_vy = sensor_fusion[i][4];
               double obj_v = sqrt(obj_vx * obj_vx + obj_vy * obj_vy);
-              double obj_s = double(sensor_fusion[i][5]) + obj_v * previous_path_x.size() * 0.02;
+              double obj_s = double(sensor_fusion[i][5]) + obj_v * reused_points * 0.02;
               double obj_d = sensor_fusion[i][6];
 
-              if ((abs(obj_d - (ref_lane * 4 + 2)) < 2) && (obj_s > ref_s) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+              if ((abs(obj_d - (ref_lane * 4 + 2)) < 2.5) && (obj_s > ref_s) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
                 keep_lane_ok = false;
               }
 
-              if ((abs(obj_d - (ref_lane * 4 - 2)) < 2) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+              if ((abs(obj_d - (ref_lane * 4 - 2)) < 2.5) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
                 switch_left_ok = false;
               }
 
-              if ((abs(obj_d - (ref_lane * 4 + 6)) < 2) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
+              if ((abs(obj_d - (ref_lane * 4 + 6)) < 2.5) && (obj_s > ref_s - REAR_SAFE_DISTANCE) && (obj_s < ref_s + FRONT_SAFE_DISTANCE)) {
                 switch_right_ok = false;
               }
             }
@@ -357,12 +418,16 @@ int main() {
               if (ref_velocity < 0) {
                 ref_velocity = 0;
               }
-            } else {
+            } else if (next_action == STATE_KEEP_LANE) {
               if (ref_velocity < MAX_VELOCITY) {
                 ref_velocity += INC_VELOCITY;
               }
               if (ref_velocity > MAX_VELOCITY) {
                 ref_velocity = MAX_VELOCITY;
+              }
+            } else {
+              if (ref_velocity > MAX_VELOCITY - 10) {
+                ref_velocity -= INC_VELOCITY;
               }
             }
 
